@@ -23,6 +23,7 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
+#include <random>
 
 #include "cuckoohash_config.hh"
 #include "cuckoohash_util.hh"
@@ -688,6 +689,47 @@ public:
    */
   locked_table lock_table() { return locked_table(*this); }
 
+  template<typename F>
+  uint erase_random_fn(uint num_elements, F fn) {
+    static std::random_device rnd_dev;
+    static std::mt19937_64 rnd_gen(rnd_dev());
+
+    size_type buckets_size = buckets_.size();
+    if (capacity() < DEFAULT_SIZE)
+      return 0;
+
+    std::uniform_int_distribution<uint64_t> dist_buckets(0, buckets_size - 1);
+    const size_type start_bucket = dist_buckets(rnd_gen);
+
+    const size_type max_buckets = 2;
+    uint del_elements = 0;
+    const size_type max_bucket_num = std::min(buckets_size, start_bucket + max_buckets);
+    for (size_type cur_bucket = start_bucket; del_elements < num_elements && cur_bucket < max_bucket_num; ++cur_bucket) {
+      const auto ob = snapshot_and_lock_one<normal_mode>(cur_bucket);
+      bucket &b = buckets_[cur_bucket];
+      for (size_type slot = 0; slot < slot_per_bucket() && del_elements < num_elements; ++slot) {
+        if (b.occupied(slot) && fn(buckets_[cur_bucket].mapped(slot))) {
+          del_from_bucket(cur_bucket, slot);
+          ++del_elements;
+        }
+      }
+    }
+
+    return del_elements;
+  }
+
+  template <typename K, typename F>
+  auto exec_fn(const K &key, F fn, mapped_type* foo=nullptr) -> decltype(fn(foo)) {
+    const hash_value hv = hashed_key(key);
+    const auto b = snapshot_and_lock_two<normal_mode>(hv);
+    const table_position pos = cuckoo_find(key, hv.partial, b.i1, b.i2);
+    if (pos.status == ok) {
+      return fn(&buckets_[pos.index].mapped(pos.slot));
+    } else {
+      return fn(nullptr);
+    }
+  }
+
   /**@}*/
 
 private:
@@ -1038,6 +1080,19 @@ private:
                                           ? nullptr
                                           : &locks[lock_ind(i3)]));
   }
+
+    template <typename TABLE_MODE>
+    LockManager snapshot_and_lock_one(const size_type &i) const {
+      while (true) {
+        const size_type hp = hashpower();
+        try {
+          return lock_one(hp, i, TABLE_MODE());
+        } catch (hashpower_changed &) {
+          // The hashpower changed while taking the locks. Try again.
+          continue;
+        }
+      }
+    }
 
   // snapshot_and_lock_two loads locks the buckets associated with the given
   // hash value, making sure the hashpower doesn't change before the locks are
